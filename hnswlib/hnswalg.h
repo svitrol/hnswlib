@@ -321,6 +321,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
 
+        // Early exit parameters
+        const int patience_delta = 30;      // how many iterations without improvement
+        const int min_visits = ef / 2;      // warmup before early stopping
+
+        int no_improvement_counter = 0;
+        int visited_nodes = 0;
+
         dist_t lowerBound;
         if (bare_bone_search || 
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
@@ -357,6 +364,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 break;
             }
             candidate_set.pop();
+            visited_nodes++;
+            bool improved = false;
 
             tableint current_node_id = current_node_pair.second;
             int *data = (int *) get_linklist0(current_node_id);
@@ -405,6 +414,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                         if (bare_bone_search || 
                             (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                            improved = true;
                             top_candidates.emplace(dist, candidate_id);
                             if (!bare_bone_search && stop_condition) {
                                 stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
@@ -432,6 +442,16 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             lowerBound = top_candidates.top().first;
                     }
                 }
+            }
+            // Patience early-exit logic
+            if (visited_nodes > min_visits && top_candidates.size() >= ef) {
+                if (improved)
+                    no_improvement_counter = 0;
+                else
+                    no_improvement_counter++;
+
+                if (no_improvement_counter >= patience_delta)
+                    break;
             }
         }
 
