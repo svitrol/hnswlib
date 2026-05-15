@@ -14,6 +14,13 @@ namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
+enum NodeAccessibility : unsigned int {
+    ACCESSIBILITY_NONE = 0,
+    ACCESSIBILITY_SPARSE = 1 << 0,
+    ACCESSIBILITY_WELL_CONNECTED = 1 << 1,
+    ACCESSIBILITY_REACHABLE_FROM_ROOT = 1 << 2
+};
+
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
  public:
@@ -30,6 +37,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t maxM0_{0};
     size_t ef_construction_{0};
     size_t ef_{ 0 };
+    size_t patience_{ 0 };
+    double patience_threshold_{ 100.0 };
 
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
@@ -112,6 +121,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         maxM_ = M_;
         maxM0_ = M_ * 2;
         ef_construction_ = std::max(ef_construction, M_);
+        patience_ = 0;
+        patience_threshold_ = 100.0;
         ef_ = 10;
 
         level_generator_.seed(random_seed);
@@ -174,6 +185,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         ef_ = ef;
     }
 
+    void setPatience(size_t patience, double threshold = 100.0) {
+        patience_ = patience;
+        patience_threshold_ = threshold;
+    }
+
 
     inline std::mutex& getLabelOpMutex(labeltype label) const {
         // calculate hash
@@ -223,27 +239,34 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
-    searchBaseLayer(tableint ep_id, const void *data_point, int layer) {
+    searchBaseLayer(tableint ep_id, const void *data_point, int layer, size_t k = 0, size_t patience = 0, double patience_threshold = 100.0, size_t* dist_comps = nullptr) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidateSet;
+        std::priority_queue<dist_t> patience_top_k;
+        size_t patience_counter = 0;
+        bool stop_search = false;
 
         dist_t lowerBound;
         if (!isMarkedDeleted(ep_id)) {
             dist_t dist = fstdistfunc_(data_point, getDataByInternalId(ep_id), dist_func_param_);
+            if (dist_comps) (*dist_comps)++;
             top_candidates.emplace(dist, ep_id);
             lowerBound = dist;
             candidateSet.emplace(-dist, ep_id);
+            if (patience > 0) {
+                patience_top_k.push(dist);
+            }
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
             candidateSet.emplace(-lowerBound, ep_id);
         }
         visited_array[ep_id] = visited_array_tag;
 
-        while (!candidateSet.empty()) {
+        while (!candidateSet.empty() && !stop_search) {
             std::pair<dist_t, tableint> curr_el_pair = candidateSet.top();
             if ((-curr_el_pair.first) > lowerBound && top_candidates.size() == ef_construction_) {
                 break;
@@ -282,6 +305,27 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 char *currObj1 = (getDataByInternalId(candidate_id));
 
                 dist_t dist1 = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                if (dist_comps) (*dist_comps)++;
+
+                if (patience > 0) {
+                    patience_counter++;
+                    bool significant = false;
+                    if (patience_top_k.size() < k) {
+                        patience_top_k.push(dist1);
+                        significant = true;
+                    } else if (dist1 < patience_top_k.top()) {
+                        patience_top_k.pop();
+                        patience_top_k.push(dist1);
+                        if (k > 0 && (100.0 * (k - 1) / k) < patience_threshold)
+                            significant = true;
+                    }
+                    if (significant) patience_counter = 0;
+                    if (patience_counter >= patience) {
+                        stop_search = true;
+                        break;
+                    }
+                }
+
                 if (top_candidates.size() < ef_construction_ || lowerBound > dist1) {
                     candidateSet.emplace(-dist1, candidate_id);
 #ifdef USE_SSE
@@ -313,25 +357,36 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         const void *data_point,
         size_t ef,
         BaseFilterFunctor* isIdAllowed = nullptr,
-        BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+        BaseSearchStopCondition<dist_t>* stop_condition = nullptr,
+        size_t k = 0,
+        size_t patience = 0,
+        double patience_threshold = 100.0,
+        size_t* dist_comps = nullptr) const {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
+        std::priority_queue<dist_t> patience_top_k;
+        size_t patience_counter = 0;
+        bool stop_search = false;
 
         dist_t lowerBound;
         if (bare_bone_search || 
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
             dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+            if (dist_comps) (*dist_comps)++;
             lowerBound = dist;
             top_candidates.emplace(dist, ep_id);
             if (!bare_bone_search && stop_condition) {
                 stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
             }
             candidate_set.emplace(-dist, ep_id);
+            if (patience > 0) {
+                patience_top_k.push(dist);
+            }
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
             candidate_set.emplace(-lowerBound, ep_id);
@@ -339,7 +394,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         visited_array[ep_id] = visited_array_tag;
 
-        while (!candidate_set.empty()) {
+        while (!candidate_set.empty() && !stop_search) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
 
@@ -387,6 +442,26 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                     char *currObj1 = (getDataByInternalId(candidate_id));
                     dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                    if (dist_comps) (*dist_comps)++;
+
+                    if (patience > 0) {
+                        patience_counter++;
+                        bool significant = false;
+                        if (patience_top_k.size() < k) {
+                            patience_top_k.push(dist);
+                            significant = true;
+                        } else if (dist < patience_top_k.top()) {
+                            patience_top_k.pop();
+                            patience_top_k.push(dist);
+                            if (k > 0 && (100.0 * (k - 1) / k) < patience_threshold)
+                                significant = true;
+                        }
+                        if (significant) patience_counter = 0;
+                        if (patience_counter >= patience) {
+                            stop_search = true;
+                            break;
+                        }
+                    }
 
                     bool flag_consider_candidate;
                     if (!bare_bone_search && stop_condition) {
@@ -1113,7 +1188,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         for (int level = dataPointLevel; level >= 0; level--) {
             std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> topCandidates = searchBaseLayer(
-                    currObj, dataPoint, level);
+                    currObj, dataPoint, level, M_, patience_, patience_threshold_, nullptr);
 
             std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> filteredTopCandidates;
             while (topCandidates.size() > 0) {
@@ -1244,7 +1319,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     throw std::runtime_error("Level error");
 
                 std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer(
-                        currObj, data_point, level);
+                        currObj, data_point, level, M_, patience_, patience_threshold_, nullptr);
                 if (epDeleted) {
                     top_candidates.emplace(fstdistfunc_(data_point, getDataByInternalId(enterpoint_copy), dist_func_param_), enterpoint_copy);
                     if (top_candidates.size() > ef_construction_)
@@ -1268,12 +1343,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t* dist_comps = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
+        if (dist_comps) (*dist_comps) = 0;
+
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        if (dist_comps) (*dist_comps)++;
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -1292,6 +1370,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
                     dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    if (dist_comps) (*dist_comps)++;
 
                     if (d < curdist) {
                         curdist = d;
@@ -1306,10 +1385,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
             top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, k, patience_, patience_threshold_, dist_comps);
         } else {
             top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, k, patience_, patience_threshold_, dist_comps);
         }
 
         while (top_candidates.size() > k) {
@@ -1407,6 +1486,65 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             std::cout << "Min inbound: " << min1 << ", Max inbound:" << max1 << "\n";
         }
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
+    }
+
+    unsigned int evaluateNodeAccessibility(tableint internal_id) const {
+        unsigned int result = ACCESSIBILITY_NONE;
+        if (internal_id >= cur_element_count) return result;
+
+        // 1. Sparse neighborhood check (Level 0)
+        linklistsizeint *ll0 = get_linklist0(internal_id);
+        int degree = getListCount(ll0);
+        if (degree < M_ / 2) {
+            result |= ACCESSIBILITY_SPARSE;
+        }
+
+        // 2. Well connected paths check
+        // Check if any neighbor at level 0 is a high-degree "hub"
+        tableint *datal = (tableint *) (ll0 + 1);
+        for (int i = 0; i < degree; i++) {
+            tableint neighbor_id = datal[i];
+            if (getListCount(get_linklist0(neighbor_id)) >= maxM0_) {
+                result |= ACCESSIBILITY_WELL_CONNECTED;
+                break;
+            }
+        }
+
+        // 3. Reachable from root check (BFS)
+        if (enterpoint_node_ != (tableint)-1) {
+            if (internal_id == enterpoint_node_) {
+                result |= ACCESSIBILITY_REACHABLE_FROM_ROOT;
+            } else {
+                VisitedList *vl = visited_list_pool_->getFreeVisitedList();
+                vl_type *visited_array = vl->mass;
+                vl_type visited_array_tag = vl->curV;
+
+                std::vector<tableint> queue;
+                queue.push_back(enterpoint_node_);
+                visited_array[enterpoint_node_] = visited_array_tag;
+
+                size_t head = 0;
+                while (head < queue.size()) {
+                    tableint curr = queue[head++];
+                    if (curr == internal_id) {
+                        result |= ACCESSIBILITY_REACHABLE_FROM_ROOT;
+                        break;
+                    }
+                    // Traverse neighbors at Level 0
+                    linklistsizeint *ll = get_linklist0(curr);
+                    int sz = getListCount(ll);
+                    tableint *neighbors = (tableint *)(ll + 1);
+                    for (int i = 0; i < sz; i++) {
+                        if (visited_array[neighbors[i]] != visited_array_tag) {
+                            visited_array[neighbors[i]] = visited_array_tag;
+                            queue.push_back(neighbors[i]);
+                        }
+                    }
+                }
+                visited_list_pool_->releaseVisitedList(vl);
+            }
+        }
+        return result;
     }
 };
 }  // namespace hnswlib

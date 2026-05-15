@@ -706,6 +706,17 @@ class Index {
         appr_alg->unmarkDelete(label);
     }
 
+    unsigned int evaluateAccessibility(size_t label) {
+        std::unique_lock<std::mutex> lock(appr_alg->label_lookup_lock);
+        auto search = appr_alg->label_lookup_.find(label);
+        if (search == appr_alg->label_lookup_.end()) {
+            throw std::runtime_error("Label not found");
+        }
+        hnswlib::tableint internal_id = search->second;
+        lock.unlock();
+        return appr_alg->evaluateNodeAccessibility(internal_id);
+    }
+
 
     void resizeIndex(size_t new_size) {
         appr_alg->resizeIndex(new_size);
@@ -927,7 +938,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
-            py::arg("filter") = py::none())
+            py::arg("filter") = py::none() false)
         .def("add_items",
             &Index<float>::addItems,
             py::arg("data"),
@@ -945,6 +956,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("path_to_index"),
             py::arg("max_elements") = 0,
             py::arg("allow_replace_deleted") = false)
+        .def("evaluate_accessibility", &Index<float>::evaluateAccessibility, py::arg("label"))
         .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))
