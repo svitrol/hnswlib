@@ -1343,7 +1343,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t* dist_comps = nullptr) const {
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        return searchKnnWithMetrics(query_data, k, isIdAllowed, nullptr);
+    }
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnnWithMetrics(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t* dist_comps = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 

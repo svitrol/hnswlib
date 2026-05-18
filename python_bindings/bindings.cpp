@@ -731,7 +731,7 @@ class Index {
             if (normalize == false) {
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                     size_t dist_comps = 0;
-                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnnWithMetrics(
                         (void*)items.data(row), k, p_idFilter, &dist_comps);
                     data_numpy_c[row] = dist_comps;
                     if (result.size() != k)
@@ -753,7 +753,7 @@ class Index {
                     normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
 
                     size_t dist_comps = 0;
-                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnn(
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnnWithMetrics(
                         (void*)(norm_array.data() + start_idx), k, p_idFilter, &dist_comps);
                     data_numpy_c[row] = dist_comps;
                     if (result.size() != k)
@@ -1038,7 +1038,7 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("data"),
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
-            py::arg("filter") = py::none() false)
+            py::arg("filter") = py::none())
         .def("knn_query_with_metrics",
             &Index<float>::knnQueryWithMetrics_return_numpy,
             py::arg("data"),
