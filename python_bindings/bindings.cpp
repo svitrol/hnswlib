@@ -213,6 +213,11 @@ class Index {
           appr_alg->ef_ = ef;
     }
 
+    void set_local_minima_params(double alpha, size_t min_degree) {
+        if (appr_alg)
+            appr_alg->setLocalMinimaParams(alpha, min_degree);
+    }
+
 
     void set_num_threads(int num_threads) {
         this->num_threads_default = num_threads;
@@ -948,6 +953,7 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
+        .def("set_local_minima_params", &Index<float>::set_local_minima_params, py::arg("alpha"), py::arg("min_degree"))
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))

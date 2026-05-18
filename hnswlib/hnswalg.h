@@ -39,6 +39,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     size_t ef_{ 0 };
     size_t patience_{ 0 };
     double patience_threshold_{ 100.0 };
+    double local_minima_alpha_{ 1.0 };
+    size_t well_connected_min_degree_{ 0 };
 
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
@@ -123,6 +125,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         ef_construction_ = std::max(ef_construction, M_);
         patience_ = 0;
         patience_threshold_ = 100.0;
+        local_minima_alpha_ = 1.0;
+        well_connected_min_degree_ = 0;
         ef_ = 10;
 
         level_generator_.seed(random_seed);
@@ -188,6 +192,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     void setPatience(size_t patience, double threshold = 100.0) {
         patience_ = patience;
         patience_threshold_ = threshold;
+    }
+
+    void setLocalMinimaParams(double alpha, size_t min_degree) {
+        local_minima_alpha_ = alpha;
+        well_connected_min_degree_ = min_degree;
     }
 
 
@@ -268,8 +277,18 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         while (!candidateSet.empty() && !stop_search) {
             std::pair<dist_t, tableint> curr_el_pair = candidateSet.top();
-            if ((-curr_el_pair.first) > lowerBound && top_candidates.size() == ef_construction_) {
-                break;
+            dist_t candidate_dist = -curr_el_pair.first;
+
+            if (candidate_dist > lowerBound && top_candidates.size() == ef_construction_) {
+                bool bypass = false;
+                if (local_minima_alpha_ > 1.0) {
+                    int* data = (int*)get_linklist_at_level(curr_el_pair.second, layer);
+                    size_t degree = getListCount((linklistsizeint*)data);
+                    if (candidate_dist <= lowerBound * local_minima_alpha_ && degree >= well_connected_min_degree_) {
+                        bypass = true;
+                    }
+                }
+                if (!bypass) break;
             }
             candidateSet.pop();
 
@@ -409,7 +428,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 }
             }
             if (flag_stop_search) {
-                break;
+                bool bypass = false;
+                if (local_minima_alpha_ > 1.0) {
+                    int* data = (int*)get_linklist0(current_node_id);
+                    size_t degree = getListCount((linklistsizeint*)data);
+                    if (candidate_dist <= lowerBound * local_minima_alpha_ && degree >= well_connected_min_degree_) {
+                        bypass = true;
+                    }
+                }
+                if (!bypass) break;
             }
             candidate_set.pop();
 
@@ -1518,6 +1545,36 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 VisitedList *vl = visited_list_pool_->getFreeVisitedList();
                 vl_type *visited_array = vl->mass;
                 vl_type visited_array_tag = vl->curV;
+
+                std::vector<tableint> queue;
+                queue.push_back(enterpoint_node_);
+                visited_array[enterpoint_node_] = visited_array_tag;
+
+                size_t head = 0;
+                while (head < queue.size()) {
+                    tableint curr = queue[head++];
+                    if (curr == internal_id) {
+                        result |= ACCESSIBILITY_REACHABLE_FROM_ROOT;
+                        break;
+                    }
+                    // Traverse neighbors at Level 0
+                    linklistsizeint *ll = get_linklist0(curr);
+                    int sz = getListCount(ll);
+                    tableint *neighbors = (tableint *)(ll + 1);
+                    for (int i = 0; i < sz; i++) {
+                        if (visited_array[neighbors[i]] != visited_array_tag) {
+                            visited_array[neighbors[i]] = visited_array_tag;
+                            queue.push_back(neighbors[i]);
+                        }
+                    }
+                }
+                visited_list_pool_->releaseVisitedList(vl);
+            }
+        }
+        return result;
+    }
+};
+}  // namespace hnswlib
 
                 std::vector<tableint> queue;
                 queue.push_back(enterpoint_node_);
