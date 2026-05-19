@@ -213,6 +213,11 @@ class Index {
           appr_alg->ef_ = ef;
     }
 
+    void set_patience(size_t patience, double threshold = 100.0) {
+        if (appr_alg)
+            appr_alg->setPatience(patience, threshold);
+    }
+
 
     void set_num_threads(int num_threads) {
         this->num_threads_default = num_threads;
@@ -1054,6 +1059,7 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
+        .def("set_patience", &Index<float>::set_patience, py::arg("patience"), py::arg("threshold") = 100.0)
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))
