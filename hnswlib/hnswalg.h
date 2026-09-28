@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <cmath>
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -194,9 +195,23 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         patience_threshold_ = threshold;
     }
 
+    // alpha <= 1.0 disables the strategy.
     void setLocalMinimaParams(double alpha, size_t min_degree) {
         local_minima_alpha_ = alpha;
         well_connected_min_degree_ = min_degree;
+    }
+
+    // Local minima strategy: when greedy search would stop, a candidate that is
+    // only slightly worse than the current worst result (within alpha) and is
+    // well connected (level-0 degree >= min_degree) is still expanded.
+    // The slack is taken from |lowerBound| so it widens the band also for
+    // negative distances (inner product space).
+    bool bypassLocalMinimum(tableint node_id, dist_t candidate_dist, dist_t lowerBound) const {
+        if (local_minima_alpha_ <= 1.0) return false;
+        dist_t slack = (dist_t)((local_minima_alpha_ - 1.0) * std::abs((double)lowerBound));
+        if (candidate_dist > lowerBound + slack) return false;
+        size_t degree = getListCount(get_linklist0(node_id));
+        return degree >= well_connected_min_degree_;
     }
 
 
@@ -247,6 +262,54 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return num_deleted_;
     }
 
+    // Early termination from "Patience in Proximity" (Teofili & Lin).
+    // After every hop (expansion of one candidate) the saturation is computed as
+    // the percentage of the current top-k that did not change during that hop.
+    // When saturation >= threshold for `patience` consecutive hops, search stops.
+    struct PatienceTracker {
+        size_t k;
+        size_t patience;
+        double threshold;
+        std::priority_queue<dist_t> top_k;  // max-heap with the k best distances seen so far
+        size_t changed{0};
+        size_t counter{0};
+
+        PatienceTracker(size_t k, size_t patience, double threshold)
+            : k(k > 0 ? k : 1), patience(patience), threshold(threshold) {}
+
+        bool enabled() const { return patience > 0; }
+
+        void observe(dist_t dist) {
+            if (!enabled()) return;
+            if (top_k.size() < k) {
+                top_k.push(dist);
+                changed++;
+            } else if (dist < top_k.top()) {
+                top_k.pop();
+                top_k.push(dist);
+                changed++;
+            }
+        }
+
+        // Closes the current hop, returns true when the search should stop.
+        // Saturation is only counted once the top-k is full.
+        bool endHop() {
+            if (!enabled()) return false;
+            size_t c = std::min(changed, k);
+            changed = 0;
+            if (top_k.size() < k) {
+                counter = 0;
+                return false;
+            }
+            double saturation = 100.0 * (double)(k - c) / (double)k;
+            if (saturation >= threshold)
+                counter++;
+            else
+                counter = 0;
+            return counter >= patience;
+        }
+    };
+
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayer(tableint ep_id, const void *data_point, int layer, size_t k = 0, size_t patience = 0, double patience_threshold = 100.0, size_t* dist_comps = nullptr) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
@@ -255,9 +318,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidateSet;
-        std::priority_queue<dist_t> patience_top_k;
-        size_t patience_counter = 0;
-        bool stop_search = false;
+        PatienceTracker tracker(k, patience, patience_threshold);
 
         dist_t lowerBound;
         if (!isMarkedDeleted(ep_id)) {
@@ -266,29 +327,17 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             top_candidates.emplace(dist, ep_id);
             lowerBound = dist;
             candidateSet.emplace(-dist, ep_id);
-            if (patience > 0) {
-                patience_top_k.push(dist);
-            }
+            tracker.observe(dist);
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
             candidateSet.emplace(-lowerBound, ep_id);
         }
         visited_array[ep_id] = visited_array_tag;
 
-        while (!candidateSet.empty() && !stop_search) {
+        while (!candidateSet.empty()) {
             std::pair<dist_t, tableint> curr_el_pair = candidateSet.top();
-            dist_t candidate_dist = -curr_el_pair.first;
-
-            if (candidate_dist > lowerBound && top_candidates.size() == ef_construction_) {
-                bool bypass = false;
-                if (local_minima_alpha_ > 1.0) {
-                    int* data = (int*)get_linklist_at_level(curr_el_pair.second, layer);
-                    size_t degree = getListCount((linklistsizeint*)data);
-                    if (candidate_dist <= lowerBound * local_minima_alpha_ && degree >= well_connected_min_degree_) {
-                        bypass = true;
-                    }
-                }
-                if (!bypass) break;
+            if ((-curr_el_pair.first) > lowerBound && top_candidates.size() == ef_construction_) {
+                break;
             }
             candidateSet.pop();
 
@@ -325,25 +374,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 dist_t dist1 = fstdistfunc_(data_point, currObj1, dist_func_param_);
                 if (dist_comps) (*dist_comps)++;
-
-                if (patience > 0) {
-                    patience_counter++;
-                    bool significant = false;
-                    if (patience_top_k.size() < k) {
-                        patience_top_k.push(dist1);
-                        significant = true;
-                    } else if (dist1 < patience_top_k.top()) {
-                        patience_top_k.pop();
-                        patience_top_k.push(dist1);
-                        if (k > 0 && (100.0 * (k - 1) / k) < patience_threshold)
-                            significant = true;
-                    }
-                    if (significant) patience_counter = 0;
-                    if (patience_counter >= patience) {
-                        stop_search = true;
-                        break;
-                    }
-                }
+                tracker.observe(dist1);
 
                 if (top_candidates.size() < ef_construction_ || lowerBound > dist1) {
                     candidateSet.emplace(-dist1, candidate_id);
@@ -361,6 +392,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         lowerBound = top_candidates.top().first;
                 }
             }
+            if (tracker.endHop()) break;
         }
         visited_list_pool_->releaseVisitedList(vl);
 
@@ -387,12 +419,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
-        std::priority_queue<dist_t> patience_top_k;
-        size_t patience_counter = 0;
-        bool stop_search = false;
+        PatienceTracker tracker(k, patience, patience_threshold);
 
         dist_t lowerBound;
-        if (bare_bone_search || 
+        if (bare_bone_search ||
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
             dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
@@ -403,9 +433,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
             }
             candidate_set.emplace(-dist, ep_id);
-            if (patience > 0) {
-                patience_top_k.push(dist);
-            }
+            tracker.observe(dist);
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
             candidate_set.emplace(-lowerBound, ep_id);
@@ -413,7 +441,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         visited_array[ep_id] = visited_array_tag;
 
-        while (!candidate_set.empty() && !stop_search) {
+        while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
 
@@ -427,16 +455,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     flag_stop_search = candidate_dist > lowerBound && top_candidates.size() == ef;
                 }
             }
-            if (flag_stop_search) {
-                bool bypass = false;
-                if (local_minima_alpha_ > 1.0) {
-                    int* data = (int*)get_linklist0(current_node_id);
-                    size_t degree = getListCount((linklistsizeint*)data);
-                    if (candidate_dist <= lowerBound * local_minima_alpha_ && degree >= well_connected_min_degree_) {
-                        bypass = true;
-                    }
-                }
-                if (!bypass) break;
+            if (flag_stop_search && !bypassLocalMinimum(current_node_pair.second, candidate_dist, lowerBound)) {
+                break;
             }
             candidate_set.pop();
 
@@ -470,25 +490,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     char *currObj1 = (getDataByInternalId(candidate_id));
                     dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
                     if (dist_comps) (*dist_comps)++;
-
-                    if (patience > 0) {
-                        patience_counter++;
-                        bool significant = false;
-                        if (patience_top_k.size() < k) {
-                            patience_top_k.push(dist);
-                            significant = true;
-                        } else if (dist < patience_top_k.top()) {
-                            patience_top_k.pop();
-                            patience_top_k.push(dist);
-                            if (k > 0 && (100.0 * (k - 1) / k) < patience_threshold)
-                                significant = true;
-                        }
-                        if (significant) patience_counter = 0;
-                        if (patience_counter >= patience) {
-                            stop_search = true;
-                            break;
-                        }
-                    }
+                    tracker.observe(dist);
 
                     bool flag_consider_candidate;
                     if (!bare_bone_search && stop_condition) {
@@ -535,6 +537,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     }
                 }
             }
+            if (tracker.endHop()) break;
         }
 
         visited_list_pool_->releaseVisitedList(vl);
@@ -1370,7 +1373,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t* dist_comps = nullptr) const {
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        return searchKnnWithMetrics(query_data, k, isIdAllowed, nullptr);
+    }
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnnWithMetrics(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr, size_t* dist_comps = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
@@ -1545,36 +1553,6 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 VisitedList *vl = visited_list_pool_->getFreeVisitedList();
                 vl_type *visited_array = vl->mass;
                 vl_type visited_array_tag = vl->curV;
-
-                std::vector<tableint> queue;
-                queue.push_back(enterpoint_node_);
-                visited_array[enterpoint_node_] = visited_array_tag;
-
-                size_t head = 0;
-                while (head < queue.size()) {
-                    tableint curr = queue[head++];
-                    if (curr == internal_id) {
-                        result |= ACCESSIBILITY_REACHABLE_FROM_ROOT;
-                        break;
-                    }
-                    // Traverse neighbors at Level 0
-                    linklistsizeint *ll = get_linklist0(curr);
-                    int sz = getListCount(ll);
-                    tableint *neighbors = (tableint *)(ll + 1);
-                    for (int i = 0; i < sz; i++) {
-                        if (visited_array[neighbors[i]] != visited_array_tag) {
-                            visited_array[neighbors[i]] = visited_array_tag;
-                            queue.push_back(neighbors[i]);
-                        }
-                    }
-                }
-                visited_list_pool_->releaseVisitedList(vl);
-            }
-        }
-        return result;
-    }
-};
-}  // namespace hnswlib
 
                 std::vector<tableint> queue;
                 queue.push_back(enterpoint_node_);
