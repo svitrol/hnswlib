@@ -218,6 +218,19 @@ class Index {
             appr_alg->setPatience(patience, threshold);
     }
 
+    void set_keep_pruned_connections(bool keep) {
+        if (!appr_alg)
+            throw std::runtime_error("call init_index before set_keep_pruned_connections");
+        appr_alg->keep_pruned_ = keep;
+    }
+
+    size_t count_unreachable() const {
+        size_t n = 0;
+        for (char r : appr_alg->reachableFromEntry())
+            n += !r;
+        return n;
+    }
+
 
     void set_num_threads(int num_threads) {
         this->num_threads_default = num_threads;
@@ -822,6 +835,21 @@ class Index {
         return appr_alg->evaluateNodeAccessibility(internal_id);
     }
 
+    py::dict repairConnectivity(size_t links_per_node, double fill_low, double fill_high, size_t m_switch,
+                                size_t sample, unsigned int seed, bool cascade) {
+        auto s = appr_alg->repairConnectivity(links_per_node, fill_low, fill_high, m_switch, sample, seed, cascade);
+        return py::dict(
+            "unreachable_before"_a = s.unreachable_before,
+            "unreachable_after"_a = s.unreachable_after,
+            "linked"_a = s.linked,
+            "links_added"_a = s.links_added,
+            "donors_above_threshold"_a = s.donors_above_threshold,
+            "donors_used"_a = s.donors_used,
+            "min_donor_degree"_a = s.min_donor_degree,
+            "cascade_donors"_a = s.cascade_donors,
+            "distance_computations"_a = s.distance_computations);
+    }
+
 
     void resizeIndex(size_t new_size) {
         appr_alg->resizeIndex(new_size);
@@ -1060,6 +1088,8 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
         .def("set_patience", &Index<float>::set_patience, py::arg("patience"), py::arg("threshold") = 100.0)
+        .def("set_keep_pruned_connections", &Index<float>::set_keep_pruned_connections, py::arg("keep"))
+        .def("count_unreachable", &Index<float>::count_unreachable)
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))
@@ -1069,6 +1099,9 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("max_elements") = 0,
             py::arg("allow_replace_deleted") = false)
         .def("evaluate_accessibility", &Index<float>::evaluateAccessibility, py::arg("label"))
+        .def("repair_connectivity", &Index<float>::repairConnectivity, py::arg("links_per_node") = 2,
+             py::arg("fill_low") = 0.5, py::arg("fill_high") = 0.75, py::arg("m_switch") = 16,
+             py::arg("sample") = 8, py::arg("seed") = 100, py::arg("cascade") = true)
         .def("mark_deleted", &Index<float>::markDeleted, py::arg("label"))
         .def("unmark_deleted", &Index<float>::unmarkDeleted, py::arg("label"))
         .def("resize_index", &Index<float>::resizeIndex, py::arg("new_size"))

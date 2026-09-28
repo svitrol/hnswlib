@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <algorithm>
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -75,6 +76,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     mutable std::atomic<long> metric_hops{0};
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
+    bool keep_pruned_ = false;  // fill link lists with connections discarded by the heuristic (build only)
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
@@ -238,6 +240,54 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return num_deleted_;
     }
 
+    // Early termination from "Patience in Proximity" (Teofili & Lin).
+    // After every hop (expansion of one candidate) the saturation is computed as
+    // the percentage of the current top-k that did not change during that hop.
+    // When saturation >= threshold for `patience` consecutive hops, search stops.
+    struct PatienceTracker {
+        size_t k;
+        size_t patience;
+        double threshold;
+        std::priority_queue<dist_t> top_k;  // max-heap with the k best distances seen so far
+        size_t changed{0};
+        size_t counter{0};
+
+        PatienceTracker(size_t k, size_t patience, double threshold)
+            : k(k > 0 ? k : 1), patience(patience), threshold(threshold) {}
+
+        bool enabled() const { return patience > 0; }
+
+        void observe(dist_t dist) {
+            if (!enabled()) return;
+            if (top_k.size() < k) {
+                top_k.push(dist);
+                changed++;
+            } else if (dist < top_k.top()) {
+                top_k.pop();
+                top_k.push(dist);
+                changed++;
+            }
+        }
+
+        // Closes the current hop, returns true when the search should stop.
+        // Saturation is only counted once the top-k is full.
+        bool endHop() {
+            if (!enabled()) return false;
+            size_t c = std::min(changed, k);
+            changed = 0;
+            if (top_k.size() < k) {
+                counter = 0;
+                return false;
+            }
+            double saturation = 100.0 * (double)(k - c) / (double)k;
+            if (saturation >= threshold)
+                counter++;
+            else
+                counter = 0;
+            return counter >= patience;
+        }
+    };
+
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayer(tableint ep_id, const void *data_point, int layer, size_t k = 0, size_t patience = 0, double patience_threshold = 100.0, size_t* dist_comps = nullptr) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
@@ -246,9 +296,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidateSet;
-        std::priority_queue<dist_t> patience_top_k;
-        size_t patience_counter = 0;
-        bool stop_search = false;
+        PatienceTracker tracker(k, patience, patience_threshold);
 
         dist_t lowerBound;
         if (!isMarkedDeleted(ep_id)) {
@@ -257,16 +305,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             top_candidates.emplace(dist, ep_id);
             lowerBound = dist;
             candidateSet.emplace(-dist, ep_id);
-            if (patience > 0) {
-                patience_top_k.push(dist);
-            }
+            tracker.observe(dist);
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
             candidateSet.emplace(-lowerBound, ep_id);
         }
         visited_array[ep_id] = visited_array_tag;
 
-        while (!candidateSet.empty() && !stop_search) {
+        while (!candidateSet.empty()) {
             std::pair<dist_t, tableint> curr_el_pair = candidateSet.top();
             if ((-curr_el_pair.first) > lowerBound && top_candidates.size() == ef_construction_) {
                 break;
@@ -306,25 +352,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                 dist_t dist1 = fstdistfunc_(data_point, currObj1, dist_func_param_);
                 if (dist_comps) (*dist_comps)++;
-
-                if (patience > 0) {
-                    patience_counter++;
-                    bool significant = false;
-                    if (patience_top_k.size() < k) {
-                        patience_top_k.push(dist1);
-                        significant = true;
-                    } else if (dist1 < patience_top_k.top()) {
-                        patience_top_k.pop();
-                        patience_top_k.push(dist1);
-                        if (k > 0 && (100.0 * (k - 1) / k) < patience_threshold)
-                            significant = true;
-                    }
-                    if (significant) patience_counter = 0;
-                    if (patience_counter >= patience) {
-                        stop_search = true;
-                        break;
-                    }
-                }
+                tracker.observe(dist1);
 
                 if (top_candidates.size() < ef_construction_ || lowerBound > dist1) {
                     candidateSet.emplace(-dist1, candidate_id);
@@ -342,6 +370,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                         lowerBound = top_candidates.top().first;
                 }
             }
+            if (tracker.endHop()) break;
         }
         visited_list_pool_->releaseVisitedList(vl);
 
@@ -368,12 +397,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> candidate_set;
-        std::priority_queue<dist_t> patience_top_k;
-        size_t patience_counter = 0;
-        bool stop_search = false;
+        PatienceTracker tracker(k, patience, patience_threshold);
 
         dist_t lowerBound;
-        if (bare_bone_search || 
+        if (bare_bone_search ||
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
             dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
@@ -384,9 +411,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
             }
             candidate_set.emplace(-dist, ep_id);
-            if (patience > 0) {
-                patience_top_k.push(dist);
-            }
+            tracker.observe(dist);
         } else {
             lowerBound = std::numeric_limits<dist_t>::max();
             candidate_set.emplace(-lowerBound, ep_id);
@@ -394,7 +419,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         visited_array[ep_id] = visited_array_tag;
 
-        while (!candidate_set.empty() && !stop_search) {
+        while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
 
@@ -443,25 +468,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     char *currObj1 = (getDataByInternalId(candidate_id));
                     dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
                     if (dist_comps) (*dist_comps)++;
-
-                    if (patience > 0) {
-                        patience_counter++;
-                        bool significant = false;
-                        if (patience_top_k.size() < k) {
-                            patience_top_k.push(dist);
-                            significant = true;
-                        } else if (dist < patience_top_k.top()) {
-                            patience_top_k.pop();
-                            patience_top_k.push(dist);
-                            if (k > 0 && (100.0 * (k - 1) / k) < patience_threshold)
-                                significant = true;
-                        }
-                        if (significant) patience_counter = 0;
-                        if (patience_counter >= patience) {
-                            stop_search = true;
-                            break;
-                        }
-                    }
+                    tracker.observe(dist);
 
                     bool flag_consider_candidate;
                     if (!bare_bone_search && stop_condition) {
@@ -508,6 +515,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     }
                 }
             }
+            if (tracker.endHop()) break;
         }
 
         visited_list_pool_->releaseVisitedList(vl);
@@ -529,6 +537,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             top_candidates.pop();
         }
 
+        std::vector<std::pair<dist_t, tableint>> pruned;  // closest first
         while (queue_closest.size()) {
             if (return_list.size() >= M)
                 break;
@@ -549,7 +558,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
             if (good) {
                 return_list.push_back(curent_pair);
+            } else if (keep_pruned_) {
+                pruned.push_back(curent_pair);
             }
+        }
+
+        // keepPrunedConnections (Malkov & Yashunin, Alg. 4): fill the free slots with the
+        // closest candidates the heuristic discarded, so the list always holds M links.
+        for (size_t i = 0; keep_pruned_ && i < pruned.size() && return_list.size() < M; i++) {
+            return_list.push_back(pruned[i]);
         }
 
         for (std::pair<dist_t, tableint> curent_pair : return_list) {
@@ -1491,6 +1508,144 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             std::cout << "Min inbound: " << min1 << ", Max inbound:" << max1 << "\n";
         }
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
+    }
+
+    // Level-0 BFS from the entry point; 1 = reachable.
+    std::vector<char> reachableFromEntry() const {
+        std::vector<char> reach(cur_element_count, 0);
+        if (cur_element_count == 0) return reach;
+        std::vector<tableint> queue{enterpoint_node_};
+        reach[enterpoint_node_] = 1;
+        for (size_t head = 0; head < queue.size(); head++) {
+            linklistsizeint *ll = get_linklist0(queue[head]);
+            int size = getListCount(ll);
+            tableint *links = (tableint *)(ll + 1);
+            for (int i = 0; i < size; i++) {
+                if (!reach[links[i]]) {
+                    reach[links[i]] = 1;
+                    queue.push_back(links[i]);
+                }
+            }
+        }
+        return reach;
+    }
+
+    struct RepairStats {
+        size_t unreachable_before{0};
+        size_t unreachable_after{0};
+        size_t linked{0};                 // unreachable nodes that received at least one link
+        size_t links_added{0};
+        size_t donors_above_threshold{0};  // donors above the fill threshold
+        size_t donors_used{0};             // donor pool size (threshold + extension)
+        size_t min_donor_degree{0};        // smallest out-degree in the donor pool
+        size_t cascade_donors{0};          // repaired nodes that later served as donors
+        size_t distance_computations{0};
+    };
+
+    /* Connectivity repair with "near-hub" donors, run once after the build.
+     * Every level-0 node that is unreachable from the entry point gets `links_per_node`
+     * incoming links (donor -> node) from reachable donors. Donors are the most filled
+     * reachable nodes that still have a free slot: all above the fill threshold
+     * (fill_low * maxM0 for M < m_switch, fill_high * maxM0 otherwise), then the next most
+     * filled ones until there are enough free slots. For each node `sample` random donors
+     * are drawn and the `links_per_node` closest are linked, so the repair costs
+     * `sample` distance computations per unreachable node.
+     * cascade: nodes that were linked become reachable and are kept in reserve; when the
+     * donor pool can no longer provide `links_per_node` donors, the reserve joins the pool
+     * (the repaired nodes then donate to the remaining ones). Not thread-safe with inserts. */
+    RepairStats repairConnectivity(size_t links_per_node = 2, double fill_low = 0.5, double fill_high = 0.75,
+                                   size_t m_switch = 16, size_t sample = 8, unsigned int seed = 100,
+                                   bool cascade = true) {
+        RepairStats stats;
+        std::vector<char> reach = reachableFromEntry();
+        std::vector<tableint> unreachable;
+        for (tableint i = 0; i < cur_element_count; i++)
+            if (!reach[i]) unreachable.push_back(i);
+        stats.unreachable_before = unreachable.size();
+        if (unreachable.empty() || links_per_node == 0) return stats;
+
+        // donor pool: reachable nodes with a free slot, most filled first
+        std::vector<tableint> donors;
+        for (tableint i = 0; i < cur_element_count; i++)
+            if (reach[i] && getListCount(get_linklist0(i)) < maxM0_) donors.push_back(i);
+        std::stable_sort(donors.begin(), donors.end(), [&](tableint a, tableint b) {
+            return getListCount(get_linklist0(a)) > getListCount(get_linklist0(b));
+        });
+        const double threshold = (M_ < m_switch ? fill_low : fill_high) * maxM0_;
+        const size_t needed = links_per_node * unreachable.size();
+        size_t free_slots = 0, used = 0;
+        for (; used < donors.size(); used++) {
+            size_t degree = getListCount(get_linklist0(donors[used]));
+            if (degree > threshold)
+                stats.donors_above_threshold++;
+            else if (free_slots >= needed)
+                break;
+            free_slots += maxM0_ - degree;
+        }
+        donors.resize(used);
+        stats.donors_used = used;
+        stats.min_donor_degree = used ? getListCount(get_linklist0(donors.back())) : 0;
+
+        std::mt19937 rng(seed);
+        std::shuffle(unreachable.begin(), unreachable.end(), rng);
+        std::vector<std::pair<dist_t, size_t>> candidates;  // (distance, position in donors)
+        std::vector<size_t> positions, full;
+        std::vector<tableint> reserve;  // repaired nodes, donors once the pool runs short
+        for (tableint node : unreachable) {
+            if (cascade && donors.size() < links_per_node && !reserve.empty()) {
+                stats.cascade_donors += reserve.size();
+                donors.insert(donors.end(), reserve.begin(), reserve.end());
+                reserve.clear();
+            }
+            if (donors.empty()) break;
+            // `sample` distinct random donors
+            size_t draws = std::min(sample, donors.size());
+            positions.clear();
+            while (positions.size() < draws) {
+                size_t pos = rng() % donors.size();
+                if (std::find(positions.begin(), positions.end(), pos) == positions.end())
+                    positions.push_back(pos);
+            }
+            candidates.clear();
+            for (size_t pos : positions) {
+                dist_t d = fstdistfunc_(getDataByInternalId(donors[pos]), getDataByInternalId(node), dist_func_param_);
+                stats.distance_computations++;
+                candidates.emplace_back(d, pos);
+            }
+            std::sort(candidates.begin(), candidates.end());
+
+            size_t added = 0;
+            full.clear();
+            for (auto &c : candidates) {
+                if (added == links_per_node) break;
+                linklistsizeint *ll = get_linklist0(donors[c.second]);
+                size_t degree = getListCount(ll);
+                tableint *links = (tableint *)(ll + 1);
+                // a cascade donor may already link to the node: that edge counts, no duplicate
+                if (std::find(links, links + degree, node) != links + degree) {
+                    added++;
+                    continue;
+                }
+                links[degree] = node;
+                setListCount(ll, (unsigned short)(degree + 1));
+                added++;
+                if (degree + 1 >= maxM0_) full.push_back(c.second);
+            }
+            stats.links_added += added;
+            if (added) {
+                stats.linked++;
+                if (cascade && getListCount(get_linklist0(node)) < maxM0_) reserve.push_back(node);
+            }
+            // drop full donors, highest position first so the swap-removal stays valid
+            std::sort(full.rbegin(), full.rend());
+            for (size_t pos : full) {
+                donors[pos] = donors.back();
+                donors.pop_back();
+            }
+        }
+        for (char r : reachableFromEntry())
+            if (!r) stats.unreachable_after++;
+        return stats;
     }
 
     unsigned int evaluateNodeAccessibility(tableint internal_id) const {
